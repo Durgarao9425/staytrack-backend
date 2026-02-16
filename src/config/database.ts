@@ -25,7 +25,9 @@ export const db = knex({
     user: process.env.DB_USER!,
     password: process.env.DB_PASSWORD!,
     database: process.env.DB_NAME!,
-    ...(process.env.DB_SOCKET_PATH ? { socketPath: process.env.DB_SOCKET_PATH } : {}),
+    ssl: {
+      rejectUnauthorized: false,
+    },
   },
   pool: {
     min: 5,
