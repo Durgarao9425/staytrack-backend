@@ -1,0 +1,1596 @@
+import { Response } from 'express';
+import db from '../config/database.js';
+import { AuthRequest } from '../middleware/auth.js';
+
+// Version marker to verify the fix is deployed
+const FIX_VERSION = 'v2.0-carry-forward-fix-2026-01-04';
+console.log(`[monthlyFeeController] Loaded with fix version: ${FIX_VERSION}`);
+
+// Diagnostic endpoint to check carry_forward calculation for a student
+export const diagnoseCarryForward = async (req: AuthRequest, res: Response) => {
+  console.log(`\n${'='.repeat(60)}`);
+  console.log(`[DIAGNOSTIC] Fix Version: ${FIX_VERSION}`);
+  console.log(`${'='.repeat(60)}`);
+
+  try {
+    const { student_id, fee_month } = req.query;
+
+    if (!student_id || !fee_month) {
+      return res.status(400).json({
+        success: false,
+        error: 'Required: student_id and fee_month (format: YYYY-MM)'
+      });
+    }
+
+    const studentId = parseInt(student_id as string);
+    const [year, month] = (fee_month as string).split('-');
+
+    // Get previous month
+    const prevMonthDate = new Date(parseInt(year), parseInt(month) - 2, 1);
+    const prevMonth = `${prevMonthDate.getFullYear()}-${String(prevMonthDate.getMonth() + 1).padStart(2, '0')}`;
+
+    console.log(`[DIAGNOSTIC] Student ID: ${studentId}`);
+    console.log(`[DIAGNOSTIC] Target Month: ${fee_month}`);
+    console.log(`[DIAGNOSTIC] Previous Month: ${prevMonth}`);
+
+    // Get student info
+    const student = await db('students').where('student_id', studentId).first();
+    console.log(`[DIAGNOSTIC] Student: ${student?.first_name} ${student?.last_name}`);
+
+    // Get previous month's fee record
+    const prevMonthFee = await db('monthly_fees')
+      .where({ student_id: studentId, fee_month: prevMonth })
+      .first();
+
+    console.log(`\n[DIAGNOSTIC] Previous Month (${prevMonth}) Fee Record:`);
+    if (prevMonthFee) {
+      console.log(`  - fee_id: ${prevMonthFee.fee_id}`);
+      console.log(`  - monthly_rent: ${prevMonthFee.monthly_rent}`);
+      console.log(`  - carry_forward: ${prevMonthFee.carry_forward}`);
+      console.log(`  - total_due: ${prevMonthFee.total_due}`);
+      console.log(`  - paid_amount: ${prevMonthFee.paid_amount}`);
+      console.log(`  - balance: ${prevMonthFee.balance}`);
+      console.log(`  - fee_status: ${prevMonthFee.fee_status}`);
+
+      // Get payments from fee_payments table
+      const payments = await db('fee_payments')
+        .where('fee_id', prevMonthFee.fee_id)
+        .select('*');
+
+      console.log(`\n[DIAGNOSTIC] Payments in fee_payments table for fee_id ${prevMonthFee.fee_id}:`);
+      if (payments.length === 0) {
+        console.log(`  - NO PAYMENTS FOUND IN fee_payments TABLE!`);
+        console.log(`  - This means paid_amount was set directly in monthly_fees`);
+      } else {
+        for (const p of payments) {
+          console.log(`  - payment_id: ${p.payment_id}, amount: ${p.amount}, date: ${p.payment_date}`);
+        }
+      }
+
+      // Calculate what carry_forward SHOULD be
+      const paymentsSum = await db('fee_payments')
+        .where('fee_id', prevMonthFee.fee_id)
+        .sum('amount as total');
+      const paymentsSumValue = parseFloat(paymentsSum[0]?.total || 0);
+      const storedPaidAmount = parseFloat(prevMonthFee.paid_amount || 0);
+      const actualPaid = paymentsSumValue > 0 ? paymentsSumValue : storedPaidAmount;
+      const totalDue = parseFloat(prevMonthFee.total_due || 0);
+      const correctCarryForward = Math.max(0, totalDue - actualPaid);
+
+      console.log(`\n[DIAGNOSTIC] Carry Forward Calculation:`);
+      console.log(`  - fee_payments SUM: ${paymentsSumValue}`);
+      console.log(`  - monthly_fees.paid_amount: ${storedPaidAmount}`);
+      console.log(`  - Using actualPaid: ${actualPaid} (${paymentsSumValue > 0 ? 'from fee_payments' : 'from monthly_fees.paid_amount'})`);
+      console.log(`  - total_due: ${totalDue}`);
+      console.log(`  - CORRECT carry_forward = max(0, ${totalDue} - ${actualPaid}) = ${correctCarryForward}`);
+    } else {
+      console.log(`  - NO FEE RECORD FOUND FOR ${prevMonth}`);
+    }
+
+    // Get current month's fee record
+    const currentMonthFee = await db('monthly_fees')
+      .where({ student_id: studentId, fee_month: fee_month })
+      .first();
+
+    console.log(`\n[DIAGNOSTIC] Current Month (${fee_month}) Fee Record:`);
+    if (currentMonthFee) {
+      console.log(`  - fee_id: ${currentMonthFee.fee_id}`);
+      console.log(`  - monthly_rent: ${currentMonthFee.monthly_rent}`);
+      console.log(`  - carry_forward: ${currentMonthFee.carry_forward} ${currentMonthFee.carry_forward != (prevMonthFee ? Math.max(0, parseFloat(prevMonthFee.total_due || 0) - parseFloat(prevMonthFee.paid_amount || 0)) : 0) ? '❌ WRONG!' : '✓ CORRECT'}`);
+      console.log(`  - total_due: ${currentMonthFee.total_due}`);
+      console.log(`  - paid_amount: ${currentMonthFee.paid_amount}`);
+      console.log(`  - balance: ${currentMonthFee.balance}`);
+      console.log(`  - fee_status: ${currentMonthFee.fee_status}`);
+    } else {
+      console.log(`  - NO FEE RECORD FOUND FOR ${fee_month}`);
+    }
+
+    console.log(`\n${'='.repeat(60)}\n`);
+
+    // Return diagnostic info
+    res.json({
+      success: true,
+      fix_version: FIX_VERSION,
+      student: {
+        student_id: studentId,
+        name: student ? `${student.first_name} ${student.last_name}` : 'Not found'
+      },
+      previous_month: {
+        month: prevMonth,
+        fee_record: prevMonthFee ? {
+          fee_id: prevMonthFee.fee_id,
+          monthly_rent: parseFloat(prevMonthFee.monthly_rent || 0),
+          carry_forward: parseFloat(prevMonthFee.carry_forward || 0),
+          total_due: parseFloat(prevMonthFee.total_due || 0),
+          paid_amount: parseFloat(prevMonthFee.paid_amount || 0),
+          balance: parseFloat(prevMonthFee.balance || 0),
+          fee_status: prevMonthFee.fee_status
+        } : null,
+        payments_in_fee_payments_table: prevMonthFee ? await db('fee_payments').where('fee_id', prevMonthFee.fee_id).select('payment_id', 'amount', 'payment_date') : []
+      },
+      current_month: {
+        month: fee_month,
+        fee_record: currentMonthFee ? {
+          fee_id: currentMonthFee.fee_id,
+          monthly_rent: parseFloat(currentMonthFee.monthly_rent || 0),
+          carry_forward: parseFloat(currentMonthFee.carry_forward || 0),
+          total_due: parseFloat(currentMonthFee.total_due || 0),
+          paid_amount: parseFloat(currentMonthFee.paid_amount || 0),
+          balance: parseFloat(currentMonthFee.balance || 0),
+          fee_status: currentMonthFee.fee_status
+        } : null
+      },
+      calculation: prevMonthFee ? {
+        fee_payments_sum: parseFloat((await db('fee_payments').where('fee_id', prevMonthFee.fee_id).sum('amount as total'))[0]?.total || 0),
+        stored_paid_amount: parseFloat(prevMonthFee.paid_amount || 0),
+        total_due: parseFloat(prevMonthFee.total_due || 0),
+        correct_carry_forward: Math.max(0, parseFloat(prevMonthFee.total_due || 0) - Math.max(
+          parseFloat((await db('fee_payments').where('fee_id', prevMonthFee.fee_id).sum('amount as total'))[0]?.total || 0),
+          parseFloat(prevMonthFee.paid_amount || 0)
+        ))
+      } : null
+    });
+  } catch (error: any) {
+    console.error('[diagnoseCarryForward] Error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+};
+
+// Helper function to cascade update future months' carry_forward when a payment is made
+// This ensures that paying a previous month correctly updates all subsequent months
+async function cascadeUpdateFutureMonths(studentId: number, hostelId: number, paidMonth: string): Promise<void> {
+  console.log(`[cascadeUpdateFutureMonths] Starting cascade for student ${studentId}, paid month: ${paidMonth}`);
+
+  try {
+    // Get all fee records for this student AFTER the paid month
+    const futureMonths = await db('monthly_fees')
+      .where('student_id', studentId)
+      .where('hostel_id', hostelId)
+      .where('fee_month', '>', paidMonth)
+      .orderBy('fee_month', 'asc');
+
+    console.log(`[cascadeUpdateFutureMonths] Found ${futureMonths.length} future month(s) to update`);
+
+    // Update each future month's carry_forward based on its previous month
+    for (const futureFee of futureMonths) {
+      const [year, month] = futureFee.fee_month.split('-');
+      const prevMonthDate = new Date(parseInt(year), parseInt(month) - 2, 1);
+      const prevMonth = `${prevMonthDate.getFullYear()}-${String(prevMonthDate.getMonth() + 1).padStart(2, '0')}`;
+
+      // Get previous month's fee record
+      const prevMonthFee = await db('monthly_fees')
+        .where({
+          student_id: studentId,
+          hostel_id: hostelId,
+          fee_month: prevMonth
+        })
+        .first();
+
+      let newCarryForward = 0;
+      if (prevMonthFee) {
+        // Calculate actual balance from previous month
+        const payments = await db('fee_payments')
+          .where('fee_id', prevMonthFee.fee_id)
+          .sum('amount as total');
+        const paymentsSum = parseFloat(payments[0]?.total || 0);
+        const storedPaidAmount = parseFloat(prevMonthFee.paid_amount || 0);
+        const actualPaid = paymentsSum > 0 ? paymentsSum : storedPaidAmount;
+        const totalDue = parseFloat(prevMonthFee.total_due || 0);
+        newCarryForward = Math.max(0, totalDue - actualPaid);
+      }
+
+      const oldCarryForward = parseFloat(futureFee.carry_forward || 0);
+
+      // Only update if carry_forward has changed
+      if (Math.abs(oldCarryForward - newCarryForward) > 0.01) {
+        const monthlyRent = parseFloat(futureFee.monthly_rent || 0);
+        const newTotalDue = monthlyRent + newCarryForward;
+        const paidAmount = parseFloat(futureFee.paid_amount || 0);
+        const newBalance = Math.max(0, newTotalDue - paidAmount);
+
+        // Determine new status
+        let newFeeStatus = 'Pending';
+        if (newBalance <= 0) {
+          newFeeStatus = 'Fully Paid';
+        } else if (paidAmount > 0) {
+          newFeeStatus = 'Partially Paid';
+        }
+
+        await db('monthly_fees')
+          .where('fee_id', futureFee.fee_id)
+          .update({
+            carry_forward: newCarryForward,
+            total_due: newTotalDue,
+            balance: newBalance,
+            fee_status: newFeeStatus,
+            updated_at: new Date()
+          });
+
+        console.log(`[cascadeUpdateFutureMonths] Updated ${futureFee.fee_month}: carry_forward ${oldCarryForward} → ${newCarryForward}, total_due ${futureFee.total_due} → ${newTotalDue}`);
+      } else {
+        console.log(`[cascadeUpdateFutureMonths] ${futureFee.fee_month}: No change needed (carry_forward=${newCarryForward})`);
+      }
+    }
+
+    console.log(`[cascadeUpdateFutureMonths] Cascade complete`);
+  } catch (error) {
+    console.error('[cascadeUpdateFutureMonths] Error:', error);
+    // Don't throw - cascade update is best-effort, payment should still succeed
+  }
+}
+
+// Helper function to recalculate balance from actual payments
+// This ensures accuracy by summing all payments (including adjustments/refunds)
+async function recalculateBalanceFromPayments(feeId: number): Promise<number> {
+  try {
+    const payments = await db('fee_payments')
+      .where('fee_id', feeId)
+      .sum('amount as total');
+
+    const totalPaid = parseFloat(payments[0]?.total || 0);
+    console.log(`[recalculateBalanceFromPayments] fee_id=${feeId}, totalPaid from fee_payments=${totalPaid}`);
+    return totalPaid;
+  } catch (error) {
+    console.error('[recalculateBalanceFromPayments] Error:', error);
+    return 0;
+  }
+}
+
+// Helper function to get previous month's actual balance (recalculated from payments)
+// This is the correct way to calculate carry forward
+async function getPreviousMonthBalance(studentId: number, prevMonth: string): Promise<number> {
+  try {
+    // Get previous month's fee record
+    const prevMonthFee = await db('monthly_fees')
+      .where({
+        student_id: studentId,
+        fee_month: prevMonth
+      })
+      .first();
+
+    if (!prevMonthFee) {
+      return 0; // No previous month record = no carry forward
+    }
+
+    // Try to recalculate balance from actual payments in fee_payments table
+    const paymentsSum = await recalculateBalanceFromPayments(prevMonthFee.fee_id);
+
+    // IMPORTANT: If no payments found in fee_payments table, use stored paid_amount as fallback
+    // This handles cases where payments were recorded directly in monthly_fees (legacy/manual)
+    const storedPaidAmount = parseFloat(prevMonthFee.paid_amount || 0);
+    const actualPaid = paymentsSum > 0 ? paymentsSum : storedPaidAmount;
+
+    const totalDue = parseFloat(prevMonthFee.total_due || 0);
+    const actualBalance = Math.max(0, totalDue - actualPaid);
+
+    console.log(`[getPreviousMonthBalance] Student ${studentId}, Month ${prevMonth}: totalDue=${totalDue}, paymentsSum=${paymentsSum}, storedPaid=${storedPaidAmount}, actualPaid=${actualPaid}, balance=${actualBalance}`);
+
+    return actualBalance;
+  } catch (error) {
+    console.error('[getPreviousMonthBalance] Error:', error);
+    // Fallback to stored balance if recalculation fails
+    const prevMonthFee = await db('monthly_fees')
+      .where({
+        student_id: studentId,
+        fee_month: prevMonth
+      })
+      .first();
+
+    return prevMonthFee ? parseFloat(prevMonthFee.balance || 0) : 0;
+  }
+}
+
+// Get all monthly fees for a student (current + past months)
+export const getMonthlyFees = async (req: AuthRequest, res: Response) => {
+  try {
+    const { studentId, hostelId, month, year } = req.query;
+    const user = req.user;
+
+    if (!studentId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Student ID is required'
+      });
+    }
+
+    let query = db('monthly_fees as mf')
+      .leftJoin('fee_payments as fp', 'mf.fee_id', 'fp.fee_id')
+      .select(
+        'mf.fee_id',
+        'mf.student_id',
+        'mf.hostel_id',
+        'mf.fee_month',
+        'mf.fee_date',
+        'mf.monthly_rent',
+        'mf.carry_forward',
+        'mf.total_due',
+        'mf.paid_amount',
+        'mf.balance',
+        'mf.fee_status',
+        'mf.due_date',
+        'mf.notes',
+        'mf.created_at',
+        'mf.updated_at',
+        db.raw('COUNT(fp.payment_id) as payment_count')
+      )
+      .where('mf.student_id', studentId)
+      .groupBy('mf.fee_id');
+
+    // Authorization check: hostel owner can only see their own hostel
+    if (user?.role_id === 2) {
+      if (!user.hostel_id) {
+        return res.status(403).json({
+          success: false,
+          error: 'Your account is not linked to any hostel.'
+        });
+      }
+      query = query.where('mf.hostel_id', user.hostel_id);
+    }
+
+    if (hostelId) {
+      query = query.where('mf.hostel_id', hostelId);
+    }
+
+    const fees = await query.orderBy('mf.fee_month', 'desc').orderBy('mf.fee_date', 'desc');
+
+    res.json({
+      success: true,
+      data: fees
+    });
+  } catch (error) {
+    console.error('Get monthly fees error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch monthly fees'
+    });
+  }
+};
+
+// Get current month fees for all students (summary view)
+export const getMonthlyFeesSummary = async (req: AuthRequest, res: Response) => {
+  console.log('[getMonthlyFeesSummary] Request received');
+  console.log('[getMonthlyFeesSummary] Query params:', req.query);
+  console.log('[getMonthlyFeesSummary] User:', req.user);
+  
+  try {
+    const { hostelId, fee_month } = req.query;
+    const user = req.user;
+
+    // Get current month if not specified
+    const now = new Date();
+    const currentMonth = fee_month || `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    console.log('[getMonthlyFeesSummary] Fetching fees for month:', currentMonth);
+
+    // Check if monthly_fees table exists
+    let monthlyFeesTableExists = false;
+    try {
+      const [tableCheck] = await db.raw(`
+        SELECT COUNT(*) as count 
+        FROM information_schema.tables 
+        WHERE table_schema = DATABASE() 
+        AND table_name = 'monthly_fees'
+      `);
+      monthlyFeesTableExists = tableCheck[0]?.count > 0;
+      console.log('[getMonthlyFeesSummary] monthly_fees table exists:', monthlyFeesTableExists);
+    } catch (error) {
+      console.warn('[getMonthlyFeesSummary] Could not check if monthly_fees table exists:', error);
+      monthlyFeesTableExists = false;
+    }
+
+    // Start query from students table to show ALL active students
+    let query = db('students as s')
+      .leftJoin('hostel_master as h', 's.hostel_id', 'h.hostel_id')
+      .leftJoin('rooms as r', 's.room_id', 'r.room_id')
+      .select(
+        's.student_id',
+        's.hostel_id',
+        's.first_name',
+        's.last_name',
+        's.phone',
+        's.email',
+        's.monthly_rent as student_monthly_rent',
+        'r.room_number',
+        's.floor_number',
+        's.admission_date'
+      )
+      .where('s.status', 'Active')
+      .whereNotNull('s.room_id')
+      .whereNotNull('s.monthly_rent');
+
+    // Only join monthly_fees if table exists
+    if (monthlyFeesTableExists) {
+      query = query.leftJoin('monthly_fees as mf', function() {
+        this.on('s.student_id', '=', 'mf.student_id')
+          .andOnVal('mf.fee_month', '=', currentMonth);
+      })
+      .select(
+        'mf.fee_id',
+        'mf.fee_month',
+        'mf.fee_date',
+        'mf.monthly_rent as fee_monthly_rent',
+        'mf.carry_forward',
+        'mf.total_due',
+        'mf.paid_amount',
+        'mf.balance',
+        'mf.fee_status',
+        'mf.due_date'
+      );
+    } else {
+      // Add null values for fee columns if table doesn't exist
+      query = query.select(
+        db.raw('NULL as fee_id'),
+        db.raw('? as fee_month', [currentMonth]),
+        db.raw('NULL as fee_date'),
+        db.raw('NULL as fee_monthly_rent'),
+        db.raw('0 as carry_forward'),
+        db.raw('NULL as total_due'),
+        db.raw('0 as paid_amount'),
+        db.raw('NULL as balance'),
+        db.raw('NULL as fee_status'),
+        db.raw('NULL as due_date')
+      );
+    }
+
+    // Authorization check
+    if (user?.role_id === 2) {
+      if (!user.hostel_id) {
+        return res.status(403).json({
+          success: false,
+          error: 'Your account is not linked to any hostel.'
+        });
+      }
+      query = query.where('s.hostel_id', user.hostel_id);
+    }
+
+    if (hostelId) {
+      query = query.where('s.hostel_id', hostelId);
+    }
+
+    console.log('[getMonthlyFeesSummary] Executing query...');
+    const results = await query.orderBy('s.first_name', 'asc');
+    console.log(`[getMonthlyFeesSummary] Query completed. Found ${results.length} active students`);
+
+    // NOTE: Auto-generation disabled (Option 2)
+    // Fee records are ONLY created when:
+    // 1. Cron job runs on 1st of month
+    // 2. User manually records a payment
+    // Students without fee records will still be shown but with null fee data
+
+    // Process results and calculate status
+    const fees = results.map((row: any) => {
+      const hasFeeRecord = row.fee_id !== null;
+      const monthlyRent = hasFeeRecord 
+        ? parseFloat(row.fee_monthly_rent || 0) 
+        : parseFloat(row.student_monthly_rent || 0);
+      
+      const carryForward = hasFeeRecord ? parseFloat(row.carry_forward || 0) : 0;
+      const totalDue = hasFeeRecord 
+        ? parseFloat(row.total_due || 0) 
+        : (monthlyRent + carryForward);
+      const paidAmount = hasFeeRecord ? parseFloat(row.paid_amount || 0) : 0;
+      const balance = hasFeeRecord 
+        ? parseFloat(row.balance || 0) 
+        : totalDue;
+
+      // Calculate status based on balance and paid amount
+      let feeStatus = 'Pending';
+      if (balance <= 0) {
+        feeStatus = 'Fully Paid';
+      } else if (paidAmount > 0) {
+        feeStatus = 'Partially Paid';
+      } else {
+        feeStatus = 'Pending';
+      }
+      
+      return {
+        fee_id: row.fee_id,
+        student_id: row.student_id,
+        hostel_id: row.hostel_id,
+        fee_month: row.fee_month || currentMonth,
+        fee_date: row.fee_date || now.getDate(),
+        monthly_rent: monthlyRent,
+        carry_forward: carryForward,
+        total_due: totalDue,
+        paid_amount: paidAmount,
+        balance: balance,
+        fee_status: hasFeeRecord ? (row.fee_status || feeStatus) : feeStatus,
+        due_date: row.due_date || null,
+        first_name: row.first_name,
+        last_name: row.last_name,
+        phone: row.phone,
+        email: row.email,
+        room_number: row.room_number,
+        floor_number: row.floor_number,
+        admission_date: row.admission_date
+      };
+    });
+
+    // Calculate summary statistics
+    const summary = {
+      total_students: fees.length,
+      fully_paid: fees.filter(f => f.fee_status === 'Fully Paid').length,
+      partially_paid: fees.filter(f => f.fee_status === 'Partially Paid').length,
+      pending: fees.filter(f => f.fee_status === 'Pending' || f.fee_status === 'Overdue' || f.fee_id === null).length,
+      total_due: fees.reduce((sum, f) => sum + (f.total_due || 0), 0),
+      total_paid: fees.reduce((sum, f) => sum + (f.paid_amount || 0), 0),
+      total_pending: fees.reduce((sum, f) => sum + (f.balance || 0), 0),
+      month: currentMonth
+    };
+
+    console.log('[getMonthlyFeesSummary] Summary calculated:', summary);
+
+    res.json({
+      success: true,
+      data: {
+        summary,
+        fees
+      }
+    });
+    console.log('[getMonthlyFeesSummary] Response sent successfully');
+  } catch (error: any) {
+    console.error('[getMonthlyFeesSummary] Error:', error);
+    console.error('[getMonthlyFeesSummary] Error details:', {
+      message: error?.message,
+      sql: error?.sql,
+      code: error?.code,
+      errno: error?.errno,
+      stack: error?.stack
+    });
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch monthly fees summary',
+      details: process.env.NODE_ENV === 'development' ? error?.message : undefined
+    });
+  }
+};
+
+// Get payments for a specific monthly fee
+export const getFeePayments = async (req: AuthRequest, res: Response) => {
+  try {
+    const { feeId } = req.params;
+    const user = req.user;
+
+    const payments = await db('fee_payments as fp')
+      .leftJoin('monthly_fees as mf', 'fp.fee_id', 'mf.fee_id')
+      .leftJoin('payment_modes as pm', 'fp.payment_mode_id', 'pm.payment_mode_id')
+      .select('fp.*', 'pm.payment_mode_name as payment_method', 'mf.fee_month')
+      .where('fp.fee_id', feeId)
+      .orderBy('fp.created_at', 'desc');
+
+    // Authorization check
+    if (user?.role_id === 2 && payments.length > 0) {
+      if (payments[0].hostel_id !== user.hostel_id) {
+        return res.status(403).json({
+          success: false,
+          error: 'You do not have permission to view these payments.'
+        });
+      }
+    }
+
+    res.json({
+      success: true,
+      data: payments
+    });
+  } catch (error) {
+    console.error('Get fee payments error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch fee payments'
+    });
+  }
+};
+
+// Get all payments for a student (across all months)
+export const getStudentAllPayments = async (req: AuthRequest, res: Response) => {
+  try {
+    const { studentId } = req.params;
+    const user = req.user;
+
+    if (!studentId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Student ID is required'
+      });
+    }
+
+    // Get student info for authorization check
+    const student = await db('students')
+      .where('student_id', studentId)
+      .first();
+
+    if (!student) {
+      return res.status(404).json({
+        success: false,
+        error: 'Student not found'
+      });
+    }
+
+    // Authorization check
+    if (user?.role_id === 2) {
+      if (!user.hostel_id || student.hostel_id !== user.hostel_id) {
+        return res.status(403).json({
+          success: false,
+          error: 'You do not have permission to view payments for this student.'
+        });
+      }
+    }
+
+    // Fetch all payments for this student
+    // Use fee_month from fee_payments, or derive from payment_date if null
+    const payments = await db('fee_payments as fp')
+      .leftJoin('payment_modes as pm', 'fp.payment_mode_id', 'pm.payment_mode_id')
+      .select(
+        'fp.*',
+        'pm.payment_mode_name as payment_method',
+        db.raw(`
+          COALESCE(
+            fp.fee_month,
+            CONCAT(
+              YEAR(fp.payment_date), 
+              '-', 
+              LPAD(MONTH(fp.payment_date), 2, '0')
+            )
+          ) as fee_month
+        `)
+      )
+      .where('fp.student_id', studentId)
+      .where('fp.is_fee_header', 0) // Only get payment records, not fee header records
+      .orderBy('fp.payment_date', 'desc')
+      .orderBy('fp.created_at', 'desc');
+
+    res.json({
+      success: true,
+      data: payments
+    });
+  } catch (error) {
+    console.error('Get student all payments error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch student payments'
+    });
+  }
+};
+
+// Record a payment for a monthly fee
+export const recordPayment = async (req: AuthRequest, res: Response) => {
+  console.log('[recordPayment] Request received');
+  console.log('[recordPayment] Body:', req.body);
+  console.log('[recordPayment] Params:', req.params);
+  console.log('[recordPayment] User:', req.user);
+  
+  try {
+    const {
+      fee_id,
+      student_id,
+      hostel_id,
+      amount,
+      payment_date,
+      payment_mode_id,
+      transaction_id,
+      receipt_number,
+      notes
+    } = req.body;
+
+    // Validate required fields (fee_id is optional if we need to create fee record)
+    if (!student_id || !hostel_id || !amount || !payment_date) {
+      return res.status(400).json({
+        success: false,
+        error: 'Required fields: student_id, hostel_id, amount, payment_date'
+      });
+    }
+
+    const user = req.user;
+
+    // Authorization check
+    if (user?.role_id === 2 && hostel_id !== user.hostel_id) {
+      return res.status(403).json({
+        success: false,
+        error: 'You do not have permission to record payments for this hostel.'
+      });
+    }
+
+    // Get student info to check monthly_rent
+    const student = await db('students')
+      .where('student_id', student_id)
+      .first();
+
+    if (!student) {
+      return res.status(404).json({
+        success: false,
+        error: 'Student not found'
+      });
+    }
+
+    if (!student.room_id || !student.monthly_rent) {
+      return res.status(400).json({
+        success: false,
+        error: 'Student does not have a room assigned or monthly rent set'
+      });
+    }
+
+    // Get fee month from request or use current month
+    const now = new Date();
+    const feeMonth = req.body.fee_month || `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    const [year, month] = feeMonth.split('-');
+    const feeDate = parseInt(month);
+
+    // Get or create the monthly fee record
+    let monthlyFee = null;
+    let actualFeeId = fee_id;
+
+    if (fee_id) {
+      // Try to get existing fee record
+      console.log('[recordPayment] Fetching monthly fee with fee_id:', fee_id);
+      monthlyFee = await db('monthly_fees')
+        .where('fee_id', fee_id)
+        .first();
+    }
+
+    // If fee record doesn't exist, create it
+    if (!monthlyFee) {
+      console.log('[recordPayment] Fee record does not exist, creating new one');
+      
+      // Check if fee already exists for this month
+      const existingFee = await db('monthly_fees')
+        .where({
+          student_id,
+          fee_month: feeMonth
+        })
+        .first();
+
+      if (existingFee) {
+        monthlyFee = existingFee;
+        actualFeeId = existingFee.fee_id;
+      } else {
+        // Get previous month's ACTUAL balance (recalculated from payments) for carry forward
+        // This ensures we only carry forward unpaid balance, not total due
+        const prevMonthDate = new Date(parseInt(year), parseInt(month) - 2, 1);
+        const prevMonth = `${prevMonthDate.getFullYear()}-${String(prevMonthDate.getMonth() + 1).padStart(2, '0')}`;
+        
+        const carryForward = await getPreviousMonthBalance(student_id, prevMonth);
+        const monthlyRent = parseFloat(student.monthly_rent || 0);
+        const totalDue = monthlyRent + carryForward;
+        const dueDate = new Date(parseInt(year), parseInt(month) - 1, 15);
+        
+        const [newFeeId] = await db('monthly_fees').insert({
+          student_id,
+          hostel_id,
+          fee_month: feeMonth,
+          fee_date: feeDate,
+          monthly_rent: monthlyRent,
+          carry_forward: carryForward,
+          total_due: totalDue,
+          paid_amount: 0.00,
+          balance: totalDue,
+          fee_status: 'Pending',
+          due_date: dueDate,
+          notes: 'Auto-created when payment recorded',
+          created_at: new Date(),
+          updated_at: new Date()
+        });
+
+        monthlyFee = await db('monthly_fees')
+          .where('fee_id', newFeeId)
+          .first();
+        
+        actualFeeId = newFeeId;
+        console.log('[recordPayment] Created new fee record with fee_id:', actualFeeId);
+      }
+    }
+
+    if (!monthlyFee) {
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to create or retrieve monthly fee record'
+      });
+    }
+
+    console.log('[recordPayment] Found monthly fee:', monthlyFee);
+
+    // Validate amount
+    const paymentAmount = parseFloat(amount);
+    if (paymentAmount <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Payment amount must be greater than 0'
+      });
+    }
+
+    // Recalculate paid amount from ALL payments (more accurate than stored value)
+    // This handles adjustments/refunds correctly
+    const existingPayments = await db('fee_payments')
+      .where('fee_id', actualFeeId)
+      .sum('amount as total');
+    
+    const currentTotalPaid = parseFloat(existingPayments[0]?.total || 0);
+    const newTotalPaid = currentTotalPaid + paymentAmount;
+    const totalDue = parseFloat(monthlyFee.total_due || 0);
+    const newBalance = Math.max(0, totalDue - newTotalPaid);
+
+    // Determine new fee status based on balance and paid amount
+    let newFeeStatus = 'Pending';
+    if (newBalance <= 0) {
+      newFeeStatus = 'Fully Paid';
+    } else if (newTotalPaid > 0) {
+      newFeeStatus = 'Partially Paid';
+    } else {
+      newFeeStatus = 'Pending';
+    }
+
+    // Start transaction
+    const trx = await db.transaction();
+
+    try {
+      // Record payment in fee_payments table
+      // Note: transaction_type is only set for ADJUSTMENT/REFUND, not for regular payments
+      const paymentData: any = {
+        fee_id: actualFeeId,
+        student_id,
+        hostel_id,
+        amount: paymentAmount,
+        payment_date: new Date(payment_date),
+        payment_mode_id: payment_mode_id || null,
+        transaction_id: transaction_id || null,
+        receipt_number: receipt_number || null,
+        notes: notes || null,
+        reason: null,
+        created_at: new Date(),
+        updated_at: new Date()
+      };
+      
+      // Only set transaction_type if column exists and we want to explicitly set it
+      // For regular payments, let database use default or NULL
+      const [paymentId] = await trx('fee_payments').insert(paymentData);
+
+      // Update monthly_fees record with recalculated values
+      await trx('monthly_fees')
+        .where('fee_id', actualFeeId)
+        .update({
+          paid_amount: newTotalPaid,
+          balance: newBalance,
+          fee_status: newFeeStatus,
+          updated_at: new Date()
+        });
+
+      // Log to fee_history
+      await trx('fee_history').insert({
+        fee_id: actualFeeId,
+        student_id,
+        action: 'paid',
+        old_values: JSON.stringify({
+          paid_amount: currentTotalPaid,
+          balance: monthlyFee.balance,
+          fee_status: monthlyFee.fee_status
+        }),
+        new_values: JSON.stringify({
+          paid_amount: newTotalPaid,
+          balance: newBalance,
+          fee_status: newFeeStatus
+        }),
+        created_by: user?.user_id || null,
+        created_at: new Date()
+      });
+
+      await trx.commit();
+
+      console.log('[recordPayment] Transaction committed successfully');
+      console.log('[recordPayment] Payment ID:', paymentId);
+      console.log('[recordPayment] Updated values - paid_amount:', newTotalPaid, 'balance:', newBalance, 'status:', newFeeStatus);
+
+      // IMPORTANT: Cascade update future months' carry_forward
+      // This ensures that paying a previous month updates all subsequent months
+      const paidFeeMonth = monthlyFee.fee_month;
+      console.log(`[recordPayment] Triggering cascade update for future months after ${paidFeeMonth}`);
+      await cascadeUpdateFutureMonths(student_id, hostel_id, paidFeeMonth);
+
+      res.status(201).json({
+        success: true,
+        message: 'Payment recorded successfully',
+        data: {
+          payment_id: paymentId,
+          fee_id: actualFeeId,
+          paid_amount: newTotalPaid,
+          balance: newBalance,
+          fee_status: newFeeStatus
+        }
+      });
+    } catch (err: any) {
+      console.error('[recordPayment] Transaction error, rolling back:', err);
+      await trx.rollback();
+      throw err;
+    }
+  } catch (error: any) {
+    console.error('[recordPayment] Error:', error);
+    console.error('[recordPayment] Error details:', {
+      message: error?.message,
+      sql: error?.sql,
+      code: error?.code,
+      errno: error?.errno,
+      stack: error?.stack
+    });
+    res.status(500).json({
+      success: false,
+      error: 'Failed to record payment',
+      details: process.env.NODE_ENV === 'development' ? error?.message : undefined
+    });
+  }
+};
+
+// Get previous months data (read-only view)
+export const getPreviousMonthsFees = async (req: AuthRequest, res: Response) => {
+  try {
+    const { studentId, hostelId, limit = 12 } = req.query;
+    const user = req.user;
+
+    if (!studentId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Student ID is required'
+      });
+    }
+
+    let query = db('monthly_fees as mf')
+      .select(
+        'mf.fee_id',
+        'mf.fee_month',
+        'mf.fee_date',
+        'mf.monthly_rent',
+        'mf.carry_forward',
+        'mf.total_due',
+        'mf.paid_amount',
+        'mf.balance',
+        'mf.fee_status',
+        'mf.due_date'
+      )
+      .where('mf.student_id', studentId);
+
+    // Authorization check
+    if (user?.role_id === 2) {
+      if (!user.hostel_id) {
+        return res.status(403).json({
+          success: false,
+          error: 'Your account is not linked to any hostel.'
+        });
+      }
+      query = query.where('mf.hostel_id', user.hostel_id);
+    }
+
+    if (hostelId) {
+      query = query.where('mf.hostel_id', hostelId);
+    }
+
+    const fees = await query
+      .orderBy('mf.fee_month', 'desc')
+      .limit(parseInt(limit as string) || 12);
+
+    // Separate current month and previous months
+    const now = new Date();
+    const currentMonthStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+
+    const currentMonthFee = fees.find(f => f.fee_month === currentMonthStr);
+    const previousMonthsFees = fees.filter(f => f.fee_month !== currentMonthStr);
+
+    res.json({
+      success: true,
+      data: {
+        current_month: currentMonthFee || null,
+        previous_months: previousMonthsFees,
+        total_paid_all_time: fees.reduce((sum, f) => sum + parseFloat(f.paid_amount || 0), 0),
+        total_pending_all_time: fees.reduce((sum, f) => sum + parseFloat(f.balance || 0), 0)
+      }
+    });
+  } catch (error) {
+    console.error('Get previous months fees error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch previous months fees'
+    });
+  }
+};
+
+// Edit current month fee (only allowed for current month)
+export const editCurrentMonthFee = async (req: AuthRequest, res: Response) => {
+  try {
+    const { feeId } = req.params;
+    const { monthly_rent, carry_forward, due_date, notes } = req.body;
+    const user = req.user;
+
+    // Get the fee record
+    const fee = await db('monthly_fees')
+      .where('fee_id', feeId)
+      .first();
+
+    if (!fee) {
+      return res.status(404).json({
+        success: false,
+        error: 'Monthly fee record not found'
+      });
+    }
+
+    // Check if it's current month
+    const now = new Date();
+    const currentMonthStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+
+    if (fee.fee_month !== currentMonthStr) {
+      return res.status(400).json({
+        success: false,
+        error: 'Can only edit current month fees'
+      });
+    }
+
+    // Authorization check
+    if (user?.role_id === 2 && fee.hostel_id !== user.hostel_id) {
+      return res.status(403).json({
+        success: false,
+        error: 'You do not have permission to edit fees for this hostel.'
+      });
+    }
+
+    // Calculate new total_due and balance
+    const newMonthlyRent = monthly_rent !== undefined ? parseFloat(monthly_rent) : parseFloat(fee.monthly_rent);
+    const newCarryForward = carry_forward !== undefined ? parseFloat(carry_forward) : parseFloat(fee.carry_forward || 0);
+    const newTotalDue = newMonthlyRent + newCarryForward;
+    const newBalance = newTotalDue - parseFloat(fee.paid_amount || 0);
+
+    // Determine fee status
+    let newFeeStatus = 'Pending';
+    if (newBalance <= 0) {
+      newFeeStatus = 'Fully Paid';
+    } else if (parseFloat(fee.paid_amount || 0) > 0) {
+      newFeeStatus = 'Partially Paid';
+    }
+
+    // Start transaction
+    const trx = await db.transaction();
+
+    try {
+      // Store old values for history
+      const oldValues = {
+        monthly_rent: fee.monthly_rent,
+        carry_forward: fee.carry_forward,
+        total_due: fee.total_due,
+        balance: fee.balance,
+        fee_status: fee.fee_status
+      };
+
+      // Update the monthly fee
+      await trx('monthly_fees')
+        .where('fee_id', feeId)
+        .update({
+          monthly_rent: newMonthlyRent,
+          carry_forward: newCarryForward,
+          total_due: newTotalDue,
+          balance: newBalance,
+          fee_status: newFeeStatus,
+          due_date: due_date || fee.due_date,
+          notes: notes !== undefined ? notes : fee.notes,
+          updated_at: new Date()
+        });
+
+      // Log to fee_history
+      await trx('fee_history').insert({
+        fee_id: feeId,
+        student_id: fee.student_id,
+        action: 'updated',
+        old_values: JSON.stringify(oldValues),
+        new_values: JSON.stringify({
+          monthly_rent: newMonthlyRent,
+          carry_forward: newCarryForward,
+          total_due: newTotalDue,
+          balance: newBalance,
+          fee_status: newFeeStatus
+        }),
+        created_by: user?.user_id || null,
+        created_at: new Date()
+      });
+
+      await trx.commit();
+
+      res.json({
+        success: true,
+        message: 'Monthly fee updated successfully',
+        data: {
+          fee_id: feeId,
+          monthly_rent: newMonthlyRent,
+          carry_forward: newCarryForward,
+          total_due: newTotalDue,
+          balance: newBalance,
+          fee_status: newFeeStatus
+        }
+      });
+    } catch (err) {
+      await trx.rollback();
+      throw err;
+    }
+  } catch (error) {
+    console.error('Edit current month fee error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to update monthly fee'
+    });
+  }
+};
+
+// Get available months for student (for dropdown/selector)
+export const getAvailableMonths = async (req: AuthRequest, res: Response) => {
+  try {
+    const { studentId, hostelId } = req.query;
+    const user = req.user;
+
+    if (!studentId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Student ID is required'
+      });
+    }
+
+    let query = db('monthly_fees')
+      .distinct('fee_month', 'fee_date')
+      .where('student_id', studentId);
+
+    // Authorization check
+    if (user?.role_id === 2) {
+      if (!user.hostel_id) {
+        return res.status(403).json({
+          success: false,
+          error: 'Your account is not linked to any hostel.'
+        });
+      }
+      query = query.where('hostel_id', user.hostel_id);
+    }
+
+    if (hostelId) {
+      query = query.where('hostel_id', hostelId);
+    }
+
+    const months = await query.orderBy('fee_month', 'desc');
+
+    res.json({
+      success: true,
+      data: months.map(m => ({
+        month: m.fee_month,
+        date: m.fee_date
+      }))
+    });
+  } catch (error) {
+    console.error('Get available months error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch available months'
+    });
+  }
+};
+
+// Record adjustment or refund (for corrections without editing payments)
+export const recordAdjustment = async (req: AuthRequest, res: Response) => {
+  console.log('[recordAdjustment] Called');
+  console.log('[recordAdjustment] Body:', req.body);
+
+  try {
+    const { feeId } = req.params;
+    const {
+      amount,
+      transaction_type,
+      reason,
+      payment_date,
+      payment_mode_id,
+      notes
+    } = req.body;
+
+    const user = req.user;
+
+    // Validate required fields
+    if (!amount || !transaction_type || !reason) {
+      return res.status(400).json({
+        success: false,
+        error: 'Required fields: amount, transaction_type, reason'
+      });
+    }
+
+    // Validate transaction type
+    if (!['ADJUSTMENT', 'REFUND'].includes(transaction_type)) {
+      return res.status(400).json({
+        success: false,
+        error: 'transaction_type must be ADJUSTMENT or REFUND'
+      });
+    }
+
+    const adjustmentAmount = parseFloat(amount);
+    if (isNaN(adjustmentAmount) || adjustmentAmount === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Amount must be a non-zero number'
+      });
+    }
+
+    // For REFUND, amount should be negative (or we make it negative)
+    const finalAmount = transaction_type === 'REFUND'
+      ? -Math.abs(adjustmentAmount)
+      : adjustmentAmount;
+
+    // Get the monthly fee record
+    const monthlyFee = await db('monthly_fees')
+      .where('fee_id', feeId)
+      .first();
+
+    if (!monthlyFee) {
+      return res.status(404).json({
+        success: false,
+        error: 'Monthly fee record not found'
+      });
+    }
+
+    // Authorization check
+    if (user?.role_id === 2 && monthlyFee.hostel_id !== user.hostel_id) {
+      return res.status(403).json({
+        success: false,
+        error: 'You do not have permission to adjust this fee.'
+      });
+    }
+
+    // Calculate new totals from ALL transactions (SUM approach)
+    const existingPayments = await db('fee_payments')
+      .where('fee_id', feeId)
+      .sum('amount as total');
+
+    const currentTotalPaid = parseFloat(existingPayments[0]?.total || 0);
+    const newTotalPaid = currentTotalPaid + finalAmount;
+
+    // Calculate new balance
+    const totalDue = parseFloat(monthlyFee.total_due || 0);
+    const newBalance = totalDue - newTotalPaid;
+
+    // Determine new status
+    let newFeeStatus = 'Pending';
+    if (newBalance <= 0) {
+      newFeeStatus = 'Fully Paid';
+    } else if (newTotalPaid > 0) {
+      newFeeStatus = 'Partially Paid';
+    }
+
+    // Start transaction
+    const trx = await db.transaction();
+
+    try {
+      // Record adjustment in fee_payments table
+      const [paymentId] = await trx('fee_payments').insert({
+        fee_id: feeId,
+        student_id: monthlyFee.student_id,
+        hostel_id: monthlyFee.hostel_id,
+        amount: finalAmount,
+        payment_date: new Date(payment_date || new Date()),
+        payment_mode_id: payment_mode_id || null,
+        transaction_type: transaction_type,
+        transaction_id: null,
+        receipt_number: null,
+        notes: notes || null,
+        reason: reason,
+        created_at: new Date(),
+        updated_at: new Date()
+      });
+
+      // Update monthly_fees record with new totals
+      await trx('monthly_fees')
+        .where('fee_id', feeId)
+        .update({
+          paid_amount: newTotalPaid,
+          balance: newBalance,
+          fee_status: newFeeStatus,
+          updated_at: new Date()
+        });
+
+      // Log to fee_history
+      await trx('fee_history').insert({
+        fee_id: feeId,
+        student_id: monthlyFee.student_id,
+        action: transaction_type.toLowerCase(),
+        old_values: JSON.stringify({
+          paid_amount: currentTotalPaid,
+          balance: monthlyFee.balance,
+          fee_status: monthlyFee.fee_status
+        }),
+        new_values: JSON.stringify({
+          paid_amount: newTotalPaid,
+          balance: newBalance,
+          fee_status: newFeeStatus,
+          adjustment_amount: finalAmount,
+          reason: reason
+        }),
+        created_by: user?.user_id || null,
+        created_at: new Date()
+      });
+
+      await trx.commit();
+
+      console.log('[recordAdjustment] Success - paymentId:', paymentId);
+
+      // IMPORTANT: Cascade update future months' carry_forward
+      const adjustedFeeMonth = monthlyFee.fee_month;
+      console.log(`[recordAdjustment] Triggering cascade update for future months after ${adjustedFeeMonth}`);
+      await cascadeUpdateFutureMonths(monthlyFee.student_id, monthlyFee.hostel_id, adjustedFeeMonth);
+
+      res.status(201).json({
+        success: true,
+        message: `${transaction_type} recorded successfully`,
+        data: {
+          payment_id: paymentId,
+          fee_id: feeId,
+          adjustment_amount: finalAmount,
+          paid_amount: newTotalPaid,
+          balance: newBalance,
+          fee_status: newFeeStatus
+        }
+      });
+    } catch (err: any) {
+      console.error('[recordAdjustment] Transaction error:', err);
+      await trx.rollback();
+      throw err;
+    }
+  } catch (error: any) {
+    console.error('[recordAdjustment] Error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to record adjustment',
+      details: process.env.NODE_ENV === 'development' ? error?.message : undefined
+    });
+  }
+};
+
+// Recalculate fee totals from all transactions (utility function)
+export const recalculateFeeTotals = async (req: AuthRequest, res: Response) => {
+  try {
+    const { feeId } = req.params;
+    const user = req.user;
+
+    // Get the monthly fee record
+    const monthlyFee = await db('monthly_fees')
+      .where('fee_id', feeId)
+      .first();
+
+    if (!monthlyFee) {
+      return res.status(404).json({
+        success: false,
+        error: 'Monthly fee record not found'
+      });
+    }
+
+    // Authorization check
+    if (user?.role_id === 2 && monthlyFee.hostel_id !== user.hostel_id) {
+      return res.status(403).json({
+        success: false,
+        error: 'Access denied'
+      });
+    }
+
+    // Calculate total from ALL transactions
+    const payments = await db('fee_payments')
+      .where('fee_id', feeId)
+      .sum('amount as total');
+
+    const totalPaid = parseFloat(payments[0]?.total || 0);
+    const totalDue = parseFloat(monthlyFee.total_due || 0);
+    const newBalance = totalDue - totalPaid;
+
+    // Determine status
+    let newFeeStatus = 'Pending';
+    if (newBalance <= 0) {
+      newFeeStatus = 'Fully Paid';
+    } else if (totalPaid > 0) {
+      newFeeStatus = 'Partially Paid';
+    }
+
+    // Update the fee record
+    await db('monthly_fees')
+      .where('fee_id', feeId)
+      .update({
+        paid_amount: totalPaid,
+        balance: newBalance,
+        fee_status: newFeeStatus,
+        updated_at: new Date()
+      });
+
+    res.json({
+      success: true,
+      message: 'Fee totals recalculated successfully',
+      data: {
+        fee_id: feeId,
+        total_due: totalDue,
+        paid_amount: totalPaid,
+        balance: newBalance,
+        fee_status: newFeeStatus
+      }
+    });
+  } catch (error: any) {
+    console.error('[recalculateFeeTotals] Error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to recalculate fee totals'
+    });
+  }
+};
+
+// Recalculate carry_forward for ALL fee records of a specific month
+// This utility fixes corrupted records where carry_forward was calculated incorrectly
+export const recalculateCarryForwardForMonth = async (req: AuthRequest, res: Response) => {
+  console.log('[recalculateCarryForwardForMonth] Called');
+  console.log('[recalculateCarryForwardForMonth] Query:', req.query);
+
+  try {
+    const { fee_month, hostelId } = req.query;
+    const user = req.user;
+
+    if (!fee_month) {
+      return res.status(400).json({
+        success: false,
+        error: 'fee_month is required (format: YYYY-MM)'
+      });
+    }
+
+    // Parse the month to get previous month
+    const [year, month] = (fee_month as string).split('-');
+    const prevMonthDate = new Date(parseInt(year), parseInt(month) - 2, 1);
+    const prevMonth = `${prevMonthDate.getFullYear()}-${String(prevMonthDate.getMonth() + 1).padStart(2, '0')}`;
+
+    console.log(`[recalculateCarryForwardForMonth] Recalculating for month ${fee_month}, previous month: ${prevMonth}`);
+
+    // Get all fee records for the specified month
+    let query = db('monthly_fees').where('fee_month', fee_month);
+
+    // Authorization check: hostel owner can only recalculate their own hostel
+    if (user?.role_id === 2) {
+      if (!user.hostel_id) {
+        return res.status(403).json({
+          success: false,
+          error: 'Your account is not linked to any hostel.'
+        });
+      }
+      query = query.where('hostel_id', user.hostel_id);
+    }
+
+    if (hostelId) {
+      query = query.where('hostel_id', hostelId);
+    }
+
+    const feeRecords = await query;
+
+    console.log(`[recalculateCarryForwardForMonth] Found ${feeRecords.length} fee records to recalculate`);
+
+    const results: any[] = [];
+    let updatedCount = 0;
+    let skippedCount = 0;
+
+    for (const feeRecord of feeRecords) {
+      try {
+        // Get previous month's fee record for this student
+        const prevMonthFee = await db('monthly_fees')
+          .where({
+            student_id: feeRecord.student_id,
+            hostel_id: feeRecord.hostel_id,
+            fee_month: prevMonth
+          })
+          .first();
+
+        let correctCarryForward = 0;
+
+        if (prevMonthFee) {
+          // Try to get payments from fee_payments table
+          const payments = await db('fee_payments')
+            .where('fee_id', prevMonthFee.fee_id)
+            .sum('amount as total');
+
+          const paymentsSum = parseFloat(payments[0]?.total || 0);
+
+          // Use stored paid_amount as fallback if no fee_payments records
+          const storedPaidAmount = parseFloat(prevMonthFee.paid_amount || 0);
+          const actualPaid = paymentsSum > 0 ? paymentsSum : storedPaidAmount;
+
+          const totalDue = parseFloat(prevMonthFee.total_due || 0);
+          correctCarryForward = Math.max(0, totalDue - actualPaid);
+        }
+
+        const currentCarryForward = parseFloat(feeRecord.carry_forward || 0);
+
+        // Check if carry_forward needs to be updated
+        if (Math.abs(currentCarryForward - correctCarryForward) > 0.01) {
+          // Calculate new total_due and balance
+          const monthlyRent = parseFloat(feeRecord.monthly_rent || 0);
+          const newTotalDue = monthlyRent + correctCarryForward;
+          const paidAmount = parseFloat(feeRecord.paid_amount || 0);
+          const newBalance = Math.max(0, newTotalDue - paidAmount);
+
+          // Determine new status
+          let newFeeStatus = 'Pending';
+          if (newBalance <= 0) {
+            newFeeStatus = 'Fully Paid';
+          } else if (paidAmount > 0) {
+            newFeeStatus = 'Partially Paid';
+          }
+
+          // Update the record
+          await db('monthly_fees')
+            .where('fee_id', feeRecord.fee_id)
+            .update({
+              carry_forward: correctCarryForward,
+              total_due: newTotalDue,
+              balance: newBalance,
+              fee_status: newFeeStatus,
+              updated_at: new Date()
+            });
+
+          results.push({
+            fee_id: feeRecord.fee_id,
+            student_id: feeRecord.student_id,
+            old_carry_forward: currentCarryForward,
+            new_carry_forward: correctCarryForward,
+            old_total_due: parseFloat(feeRecord.total_due),
+            new_total_due: newTotalDue,
+            old_balance: parseFloat(feeRecord.balance),
+            new_balance: newBalance,
+            status: 'updated'
+          });
+
+          updatedCount++;
+        } else {
+          results.push({
+            fee_id: feeRecord.fee_id,
+            student_id: feeRecord.student_id,
+            carry_forward: currentCarryForward,
+            status: 'no_change_needed'
+          });
+          skippedCount++;
+        }
+      } catch (err) {
+        console.error(`[recalculateCarryForwardForMonth] Error processing fee_id ${feeRecord.fee_id}:`, err);
+        results.push({
+          fee_id: feeRecord.fee_id,
+          student_id: feeRecord.student_id,
+          status: 'error',
+          error: err instanceof Error ? err.message : 'Unknown error'
+        });
+      }
+    }
+
+    console.log(`[recalculateCarryForwardForMonth] Completed: ${updatedCount} updated, ${skippedCount} skipped`);
+
+    res.json({
+      success: true,
+      message: `Carry forward recalculated for ${fee_month}`,
+      data: {
+        total_records: feeRecords.length,
+        updated: updatedCount,
+        skipped: skippedCount,
+        details: results
+      }
+    });
+  } catch (error: any) {
+    console.error('[recalculateCarryForwardForMonth] Error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to recalculate carry forward',
+      details: process.env.NODE_ENV === 'development' ? error?.message : undefined
+    });
+  }
+};
