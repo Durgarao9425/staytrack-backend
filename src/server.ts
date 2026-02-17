@@ -21,6 +21,8 @@ import dashboardRoutes from './routes/dashboardRoutes.js';
 import { startMonthlyFeesGenerationJob } from './jobs/monthlyFeesGeneration.js';
 import { startDailyReportJob } from './jobs/dailyReportJob.js';
 import applicationRoutes from './routes/applicationRoutes.js';
+import notificationRoutes from './routes/notificationRoutes.js';
+import maintenanceRoutes from './routes/maintenanceRoutes.js';
 
 // Load environment variables
 dotenv.config();
@@ -70,6 +72,8 @@ app.use('/api/relations', relationsRoutes);
 app.use('/api/id-proof-types', idProofTypesRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api', applicationRoutes);
+app.use('/api/notifications', notificationRoutes);
+app.use('/api/maintenance', maintenanceRoutes);
 
 // Health check
 app.get('/health', (req, res) => {
