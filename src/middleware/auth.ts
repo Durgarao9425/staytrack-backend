@@ -13,14 +13,20 @@ export const authMiddleware = (
   try {
     const authHeader = req.headers.authorization;
 
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    let token: string | undefined;
+
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      token = authHeader.substring(7);
+    } else if (req.query && req.query.token) {
+      token = req.query.token as string;
+    }
+
+    if (!token) {
       return res.status(401).json({
         success: false,
         error: 'Access token is required',
       });
     }
-
-    const token = authHeader.substring(7);
     const payload = verifyToken(token);
 
     req.user = payload;

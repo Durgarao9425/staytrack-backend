@@ -15,14 +15,14 @@ const convertToDateOnly = (dateValue: any): string | null => {
 // Get all students (Owner sees only their hostel students)
 export const getStudents = async (req: AuthRequest, res: Response) => {
   try {
-    const { hostelId } = req.query;
+    const { hostelId, status, search, date } = req.query;
     const user = req.user;
 
     let query = db('students as s')
       .leftJoin('hostel_master as h', 's.hostel_id', 'h.hostel_id')
       .leftJoin('rooms as r', 's.room_id', 'r.room_id')
       .select(
-        's.*', // This includes room_id, monthly_rent, inactive_date
+        's.*',
         'h.hostel_name',
         'r.room_number',
         'r.floor_number',
@@ -43,6 +43,28 @@ export const getStudents = async (req: AuthRequest, res: Response) => {
     // Filter by specific hostel if provided
     if (hostelId) {
       query = query.where('s.hostel_id', hostelId);
+    }
+
+    // Filter by status (1=Active, 0=Inactive)
+    if (status !== undefined) {
+      query = query.where('s.status', status);
+    }
+
+    // Filter by date (Admission Date) if provided
+    if (date) {
+      // Assuming date is in YYYY-MM-DD format
+      query = query.whereRaw('DATE(s.admission_date) = ?', [date]);
+    }
+
+    // Search filter
+    if (search) {
+      const searchTerm = `%${search}%`;
+      query = query.where(builder => {
+        builder.where('s.first_name', 'like', searchTerm)
+          .orWhere('s.last_name', 'like', searchTerm)
+          .orWhere('s.phone', 'like', searchTerm)
+          .orWhere('r.room_number', 'like', searchTerm);
+      });
     }
 
     const students = await query.orderBy('s.created_at', 'desc');

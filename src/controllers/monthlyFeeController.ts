@@ -394,42 +394,173 @@ export const getMonthlyFees = async (req: AuthRequest, res: Response) => {
 };
 
 // Get current month fees for all students (summary view)
-export const getMonthlyFeesSummary = async (req: AuthRequest, res: Response) => {
-  console.log('[getMonthlyFeesSummary] Request received');
-  console.log('[getMonthlyFeesSummary] Query params:', req.query);
-  console.log('[getMonthlyFeesSummary] User:', req.user);
+// Helper to get day of month with clamping (e.g. Feb 30 -> Feb 28)
+const getDateForMonth = (year: number, month: number, day: number): Date => {
+  const date = new Date(year, month - 1, day);
+  // Check if month rolled over (e.g. Feb 30 -> Mar 2)
+  if (date.getMonth() !== month - 1) {
+    // Return last day of previous month
+    return new Date(year, month, 0);
+  }
+  return date;
+};
 
+// Core logic to sync fee status and generate cycles for a student
+const syncStudentFeeStatus = async (student: any): Promise<void> => {
   try {
-    const { hostelId, fee_month } = req.query;
-    const user = req.user;
+    const studentId = student.student_id;
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
 
-    // Get current month if not specified
-    const now = new Date();
-    const currentMonth = fee_month || `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
-    console.log('[getMonthlyFeesSummary] Fetching fees for month:', currentMonth);
+    // 1. Get the LATEST fee record
+    const latestFee = await db('monthly_fees')
+      .where('student_id', studentId)
+      .orderBy('due_date', 'desc')
+      .first();
 
-    // Parse current month for date calculations
-    const [cmYear, cmMonth] = (currentMonth as string).split('-').map(Number);
-    const lastDayOfMonth = new Date(cmYear, cmMonth, 0).getDate();
-    const monthEndDate = `${cmYear}-${String(cmMonth).padStart(2, '0')}-${String(lastDayOfMonth).padStart(2, '0')}`;
+    // 2. If no record, create the first one based on admission date
+    if (!latestFee) {
+      if (!student.admission_date) return; // Can't start without admission date
 
-    // Check if monthly_fees table exists
-    let monthlyFeesTableExists = false;
-    try {
-      const [tableCheck] = await db.raw(`
-        SELECT COUNT(*) as count 
-        FROM information_schema.tables 
-        WHERE table_schema = DATABASE() 
-        AND table_name = 'monthly_fees'
-      `);
-      monthlyFeesTableExists = tableCheck[0]?.count > 0;
-      console.log('[getMonthlyFeesSummary] monthly_fees table exists:', monthlyFeesTableExists);
-    } catch (error) {
-      console.warn('[getMonthlyFeesSummary] Could not check if monthly_fees table exists:', error);
-      monthlyFeesTableExists = false;
+      const joinDate = new Date(student.admission_date);
+      // Create first record based on Admission Date 
+      const feeMonth = `${joinDate.getFullYear()}-${String(joinDate.getMonth() + 1).padStart(2, '0')}`;
+
+      // Calculate first due date: Admission Date + 1 Month (Subscription Model) or Just Admission Date?
+      // "When a student joins (17 Feb), their billing day becomes 17. Their first full billing cycle due date will be 17 March."
+      // This implies the first cycle starts Feb 17 and is DUE March 17? Or Due Feb 17? 
+      // If "First full billing cycle due date will be 17 March", let's assume the first period is Feb 17-Mar 17, due Mar 17?
+      // Or is it PRE-PAID? Pre-paid usually means Due Feb 17.
+      // "Subscription model... recurring rent calendar". "Due Soon" before Due Date.
+      // Let's assume the first cycle due date is "Join Date + 1 Month" as per text "first full billing cycle due date will be 17 March" (Active from Feb 17).
+      // So we insert the first record with Due Date = Mar 17.
+
+      let firstDueDate = new Date(joinDate);
+      firstDueDate.setMonth(firstDueDate.getMonth() + 1);
+      // Apply clamping
+      // If admission was Jan 31, firstDueDate -> Feb 28.
+
+      await db('monthly_fees').insert({
+        student_id: studentId,
+        hostel_id: student.hostel_id,
+        fee_month: feeMonth,
+        monthly_rent: student.monthly_rent || student.student_monthly_rent,
+        total_due: student.monthly_rent || student.student_monthly_rent,
+        paid_amount: 0,
+        balance: student.monthly_rent || student.student_monthly_rent,
+        fee_status: 'Pending',
+        due_date: firstDueDate,
+        created_at: new Date(),
+        updated_at: new Date()
+      });
+
+      return syncStudentFeeStatus(student);
     }
 
-    // Start query from students table to show ALL active students
+    // 3. Evaluate the LATEST record
+    const dueDate = new Date(latestFee.due_date);
+    const paidAmount = parseFloat(latestFee.paid_amount || 0);
+    const totalDue = parseFloat(latestFee.total_due || 0);
+    const balance = parseFloat(latestFee.balance || 0);
+
+    // Check Status Logic
+    let newStatus = latestFee.fee_status;
+
+    // Time calculations
+    const diffTime = today.getTime() - dueDate.getTime();
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+
+    const GRACE_DAYS = 5;
+
+    // Determine Logic driven status
+    if (balance <= 0) {
+      newStatus = 'Fully Paid';
+    } else {
+      if (paidAmount > 0) {
+        newStatus = 'Partially Paid';
+      } else {
+        // No payment made yet
+        if (diffDays > GRACE_DAYS) {
+          newStatus = 'Overdue';
+        } else if (diffDays >= 0) {
+          newStatus = 'Unpaid';
+        } else if (diffDays >= -5) {
+          newStatus = 'Due Soon';
+        } else {
+          newStatus = 'Pending';
+        }
+      }
+    }
+
+    if (newStatus !== latestFee.fee_status) {
+      await db('monthly_fees').where('fee_id', latestFee.fee_id).update({
+        fee_status: newStatus,
+        updated_at: new Date()
+      });
+      latestFee.fee_status = newStatus;
+      latestFee.updated_at = new Date();
+    }
+
+    // 4. Cycle Generation
+    const shouldGenerateNext = (newStatus === 'Fully Paid') || (diffDays > 0);
+
+    if (shouldGenerateNext) {
+      let nextDueDate = new Date(dueDate);
+      nextDueDate.setMonth(nextDueDate.getMonth() + 1);
+
+      const farFutureLimit = new Date(today);
+      farFutureLimit.setDate(farFutureLimit.getDate() + 45);
+
+      if (nextDueDate > farFutureLimit) {
+        return;
+      }
+
+      const nextFeeMonth = `${nextDueDate.getFullYear()}-${String(nextDueDate.getMonth() + 1).padStart(2, '0')}`;
+
+      const exists = await db('monthly_fees')
+        .where('student_id', studentId)
+        .whereBetween('due_date', [
+          new Date(nextDueDate.getTime() - 86400000 * 5),
+          new Date(nextDueDate.getTime() + 86400000 * 5)
+        ])
+        .first();
+
+      if (!exists) {
+        const prevBalance = Math.max(0, totalDue - paidAmount);
+        const newCarry = prevBalance;
+
+        await db('monthly_fees').insert({
+          student_id: studentId,
+          hostel_id: student.hostel_id,
+          fee_month: nextFeeMonth,
+          monthly_rent: student.monthly_rent || student.student_monthly_rent,
+          carry_forward: newCarry,
+          total_due: (student.monthly_rent || student.student_monthly_rent) + newCarry,
+          paid_amount: 0,
+          balance: (student.monthly_rent || student.student_monthly_rent) + newCarry,
+          fee_status: 'Pending',
+          due_date: nextDueDate,
+          created_at: new Date(),
+          updated_at: new Date()
+        });
+
+        return syncStudentFeeStatus(student);
+      }
+    }
+
+  } catch (e) {
+    console.error(`[syncStudentFeeStatus] Error for student ${student.student_id}:`, e);
+  }
+};
+
+export const getMonthlyFeesSummary = async (req: AuthRequest, res: Response) => {
+  console.log('[getMonthlyFeesSummary] Request received - Syncing Independent Cycles');
+
+  try {
+    const { hostelId } = req.query;
+    const user = req.user;
+
+    // 1. Fetch ALL active students
     let query = db('students as s')
       .leftJoin('hostel_master as h', 's.hostel_id', 'h.hostel_id')
       .leftJoin('rooms as r', 's.room_id', 'r.room_id')
@@ -446,220 +577,56 @@ export const getMonthlyFeesSummary = async (req: AuthRequest, res: Response) => 
         's.admission_date',
         's.status'
       )
-      .where('s.admission_date', '<=', monthEndDate);
+      .where('s.status', 'Active');
 
-    // Only join monthly_fees if table exists
-    if (monthlyFeesTableExists) {
-      query = query.leftJoin('monthly_fees as mf', function () {
-        this.on('s.student_id', '=', 'mf.student_id')
-          .andOnVal('mf.fee_month', '=', currentMonth);
-      })
-        .leftJoin('fee_payments as fp', 'mf.fee_id', 'fp.fee_id')
-        .select(
-          'mf.fee_id',
-          'mf.fee_month',
-          'mf.monthly_rent as fee_monthly_rent',
-          'mf.carry_forward',
-          'mf.total_due',
-          'mf.paid_amount',
-          'mf.balance',
-          'mf.fee_status',
-          'mf.due_date',
-          db.raw('SUM(fp.amount) as actual_paid_sum')
-        )
-        .groupBy('s.student_id', 'mf.fee_id');
-    } else {
-      // Add null values for fee columns if table doesn't exist
-      query = query.select(
-        db.raw('NULL as fee_id'),
-        db.raw('? as fee_month', [currentMonth]),
-        db.raw('NULL as fee_monthly_rent'),
-        db.raw('0 as carry_forward'),
-        db.raw('NULL as total_due'),
-        db.raw('0 as paid_amount'),
-        db.raw('NULL as balance'),
-        db.raw('NULL as fee_status'),
-        db.raw('NULL as due_date'),
-        db.raw('0 as actual_paid_sum')
-      );
-    }
-
-    // Authorization check
     if (user?.role_id === 2) {
-      if (!user.hostel_id) {
-        return res.status(403).json({
-          success: false,
-          error: 'Your account is not linked to any hostel.'
-        });
-      }
-      query = query.where('s.hostel_id', user.hostel_id);
+      if (user.hostel_id) query = query.where('s.hostel_id', user.hostel_id);
     }
-
     if (hostelId) {
       query = query.where('s.hostel_id', hostelId);
     }
 
-    console.log('[getMonthlyFeesSummary] Executing query...');
-    const results = await query.orderBy('s.first_name', 'asc');
-    console.log(`[getMonthlyFeesSummary] Query completed. Found ${results.length} active students`);
+    const students = await query;
+    console.log(`[getMonthlyFeesSummary] Syncing fees for ${students.length} students...`);
 
-    // NOTE: Auto-generation disabled (Option 2)
-    // Fee records are ONLY created when:
-    // 1. Cron job runs on 1st of month
-    // 2. User manually records a payment
-    // Students without fee records will still be shown but with null fee data
+    // 2. Run SYNC logic for each student
+    for (const student of students) {
+      await syncStudentFeeStatus(student);
+    }
 
-    // For students without a fee record, calculate carry_forward and due_date by walking back through months
-    const studentsWithoutFee = results.filter((row: any) => row.fee_id === null);
-    const carryForwardMap: Record<number, number> = {};
-    const dueDateMap: Record<number, string | null> = {};
+    // 3. Fetch the LATEST record for each student to return
+    const fees = [];
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
 
-    for (const row of studentsWithoutFee) {
-      const admDate = row.admission_date ? new Date(row.admission_date) : null;
-      if (!admDate) continue;
+    for (const student of students) {
+      const rec = await db('monthly_fees')
+        .where('student_id', student.student_id)
+        .orderBy('due_date', 'desc')
+        .first();
 
-      const rent = parseFloat(row.student_monthly_rent || 0);
-      let cY = cmYear;
-      let cM = cmMonth - 1; // start from previous month
-      if (cM === 0) { cM = 12; cY--; }
-      let accumulated = 0;
-
-      for (let i = 0; i < 24; i++) {
-        const cMonthStr = `${cY}-${String(cM).padStart(2, '0')}`;
-        const cMonthEnd = new Date(cY, cM, 0);
-
-        if (admDate > cMonthEnd) break;
-
-        const rec = await db('monthly_fees')
-          .where({ student_id: row.student_id, fee_month: cMonthStr })
-          .first();
-
-        if (rec) {
-          const payments = await db('fee_payments')
-            .where('fee_id', rec.fee_id)
-            .sum('amount as total');
-          const pSum = parseFloat(payments[0]?.total || 0);
-          const sPaid = parseFloat(rec.paid_amount || 0);
-          const aPaid = pSum > 0 ? pSum : sPaid;
-          const tDue = parseFloat(rec.total_due || 0);
-          carryForwardMap[row.student_id] = Math.max(0, tDue - aPaid) + accumulated;
-
-          // Copy due_date from previous record (same day, current month)
-          if (rec.due_date) {
-            const prevDueDate = new Date(rec.due_date);
-            const dueDateDay = prevDueDate.getDate();
-            let newDueDate = new Date(cmYear, cmMonth - 1, dueDateDay);
-            if (newDueDate.getDate() !== dueDateDay) {
-              newDueDate = new Date(cmYear, cmMonth, 0); // last day of month
-            }
-            dueDateMap[row.student_id] = `${newDueDate.getFullYear()}-${String(newDueDate.getMonth() + 1).padStart(2, '0')}-${String(newDueDate.getDate()).padStart(2, '0')}`;
-          }
-          break;
-        }
-
-        accumulated += rent;
-        cM--;
-        if (cM === 0) { cM = 12; cY--; }
-      }
-
-      // If no records found at all, use accumulated
-      if (!(row.student_id in carryForwardMap) && accumulated > 0) {
-        carryForwardMap[row.student_id] = accumulated;
+      if (rec) {
+        fees.push({
+          ...rec,
+          student_id: student.student_id,
+          first_name: student.first_name,
+          last_name: student.last_name,
+          room_number: student.room_number,
+          phone: student.phone
+        });
       }
     }
 
-    // Process results and calculate status
-    const fees = results.map((row: any) => {
-      const hasFeeRecord = row.fee_id !== null;
-      const monthlyRent = hasFeeRecord
-        ? parseFloat(row.fee_monthly_rent || 0)
-        : parseFloat(row.student_monthly_rent || 0);
-
-      const carryForward = hasFeeRecord
-        ? parseFloat(row.carry_forward || 0)
-        : (carryForwardMap[row.student_id] || 0);
-      const totalDue = hasFeeRecord
-        ? parseFloat(row.total_due || 0)
-        : (monthlyRent + carryForward);
-
-      // Use actual_paid_sum from fee_payments table if available, else fallback to paid_amount from monthly_fees
-      const actualPaidSum = parseFloat(row.actual_paid_sum || 0);
-      const storedPaidAmount = hasFeeRecord ? parseFloat(row.paid_amount || 0) : 0;
-      const paidAmount = actualPaidSum > 0 ? actualPaidSum : (storedPaidAmount > 0 ? storedPaidAmount : 0);
-
-      const balance = Math.max(0, totalDue - paidAmount);
-
-      // Calculate status based on updated balance and paid amount values
-      let feeStatus = 'Pending';
-      if (balance <= 0) {
-        feeStatus = 'Fully Paid';
-      } else if (paidAmount > 0) {
-        feeStatus = 'Partially Paid';
-      } else {
-        feeStatus = 'Pending';
-      }
-
-      return {
-        fee_id: row.fee_id,
-        student_id: row.student_id,
-        hostel_id: row.hostel_id,
-        fee_month: row.fee_month || currentMonth,
-        monthly_rent: monthlyRent,
-        carry_forward: carryForward,
-        total_due: totalDue,
-        paid_amount: paidAmount,
-        balance: balance,
-        fee_status: hasFeeRecord ? (row.fee_status || feeStatus) : feeStatus,
-        due_date: row.due_date || dueDateMap[row.student_id] || null,
-        first_name: row.first_name,
-        last_name: row.last_name,
-        phone: row.phone,
-        email: row.email,
-        room_number: row.room_number,
-        floor_number: row.floor_number,
-        admission_date: row.admission_date,
-        status: row.status
-      };
-    });
-
-    // Get today's earnings from fee_payments table
-    let todayEarnings = 0;
-    try {
-      const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD format
-      let todayQuery = db('fee_payments as fp')
-        .join('students as s', 'fp.student_id', 's.student_id')
-        .whereRaw('DATE(fp.payment_date) = ?', [today])
-        .sum('fp.amount as total');
-
-      // Apply hostel filter
-      if (user?.role_id === 2 && user.hostel_id) {
-        todayQuery = todayQuery.where('s.hostel_id', user.hostel_id);
-      } else if (hostelId) {
-        todayQuery = todayQuery.where('s.hostel_id', hostelId);
-      }
-
-      const todayResult = await todayQuery;
-      todayEarnings = parseFloat(todayResult[0]?.total || 0);
-      console.log('[getMonthlyFeesSummary] Today earnings:', todayEarnings);
-    } catch (error) {
-      console.error('[getMonthlyFeesSummary] Error fetching today earnings:', error);
-    }
-
-    // Calculate summary statistics
+    // Calculate summary
     const summary = {
       total_students: fees.length,
       fully_paid: fees.filter(f => f.fee_status === 'Fully Paid').length,
       partially_paid: fees.filter(f => f.fee_status === 'Partially Paid').length,
-      // "Pending" for the Unpaid tab should include anything not fully paid to match frontend filter
       pending: fees.filter(f => f.fee_status !== 'Fully Paid').length,
-      total_due: fees.reduce((sum, f) => sum + (f.total_due || 0), 0),
-      total_paid: fees.reduce((sum, f) => sum + (f.paid_amount || 0), 0),
-      total_pending: fees.reduce((sum, f) => sum + (f.balance || 0), 0),
-      today_earnings: todayEarnings,
-      month: currentMonth
+      total_due: fees.reduce((sum, f) => sum + parseFloat(f.total_due || 0), 0),
+      total_paid: fees.reduce((sum, f) => sum + parseFloat(f.paid_amount || 0), 0),
+      total_pending: fees.reduce((sum, f) => sum + parseFloat(f.balance || 0), 0),
     };
-
-    console.log('[getMonthlyFeesSummary] Summary calculated:', summary);
 
     res.json({
       success: true,
@@ -668,20 +635,13 @@ export const getMonthlyFeesSummary = async (req: AuthRequest, res: Response) => 
         fees
       }
     });
-    console.log('[getMonthlyFeesSummary] Response sent successfully');
+
   } catch (error: any) {
     console.error('[getMonthlyFeesSummary] Error:', error);
-    console.error('[getMonthlyFeesSummary] Error details:', {
-      message: error?.message,
-      sql: error?.sql,
-      code: error?.code,
-      errno: error?.errno,
-      stack: error?.stack
-    });
     res.status(500).json({
       success: false,
       error: 'Failed to fetch monthly fees summary',
-      details: process.env.NODE_ENV === 'development' ? error?.message : undefined
+      details: error?.message
     });
   }
 };

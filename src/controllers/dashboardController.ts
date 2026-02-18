@@ -98,6 +98,7 @@ export const getOwnerDashboardStats = async (req: AuthRequest, res: Response) =>
                 db.raw('COALESCE(r.room_number, "N/A") as room_number'),
                 'mf.balance as amount',
                 'mf.due_date',
+                's.phone',
                 db.raw('DATEDIFF(mf.due_date, CURDATE()) as days_left')
             )
             .orderBy('mf.due_date', 'asc')
